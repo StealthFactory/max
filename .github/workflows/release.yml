@@ -1,0 +1,135 @@
+name: Release max
+
+on:
+  push:
+    tags: ['v*']
+  repository_dispatch:
+    types: [max-release]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: max-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.repository == 'StealthFactory/max' && github.event.deleted != true
+    runs-on: xcode-27
+    permissions:
+      contents: write
+    steps:
+      - name: Resolve the tagged source
+        id: source
+        env:
+          SOURCE_READ_TOKEN: ${{ secrets.SOURCE_READ_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text())
+          if os.environ['GITHUB_REPOSITORY'] != 'StealthFactory/max':
+              raise SystemExit('Releases run only in StealthFactory/max')
+          if os.environ['GITHUB_EVENT_NAME'] == 'repository_dispatch':
+              payload = event.get('client_payload', {})
+              if event.get('action') != 'max-release' or payload.get('source_repository') != 'StealthFactory/ok':
+                  raise SystemExit('Unexpected release source')
+              repository, tag, commit = payload['source_repository'], payload.get('tag', ''), payload.get('commit', '')
+              if not os.environ.get('SOURCE_READ_TOKEN'):
+                  raise SystemExit('Configure SOURCE_READ_TOKEN in StealthFactory/max')
+          elif os.environ['GITHUB_EVENT_NAME'] == 'push':
+              if event.get('deleted') or event.get('forced') or not event.get('ref', '').startswith('refs/tags/'):
+                  raise SystemExit('Release requires a newly pushed version tag')
+              repository, tag, commit = os.environ['GITHUB_REPOSITORY'], event['ref'][10:], os.environ['GITHUB_SHA']
+          else:
+              raise SystemExit('Release requires a version tag')
+          if not isinstance(tag, str) or not re.fullmatch(r'v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)', tag):
+              raise SystemExit('Use a stable tag such as v0.1.0')
+          if not isinstance(commit, str) or not re.fullmatch(r'[0-9a-f]{40}', commit):
+              raise SystemExit('Expected the exact source commit')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              for key, value in {'repository': repository, 'tag': tag, 'commit': commit, 'version': tag[1:]}.items():
+                  output.write(f'{key}={value}\n')
+          PY
+      - name: Check out the private tagged source
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ steps.source.outputs.repository }}
+          ref: ${{ steps.source.outputs.commit }}
+          token: ${{ secrets.SOURCE_READ_TOKEN }}
+          fetch-depth: 0
+          persist-credentials: false
+          show-progress: false
+      - name: Check out the public tagged source
+        if: github.event_name == 'push'
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.source.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+          show-progress: false
+      - name: Verify tag and main ancestry
+        env:
+          RELEASE_TAG: ${{ steps.source.outputs.tag }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+        run: |
+          python3 - <<'PY'
+          import os, subprocess
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+          head = git('rev-parse', 'HEAD')
+          if head != git('rev-parse', os.environ['SOURCE_COMMIT'] + '^{commit}') or head != git('rev-parse', 'refs/tags/' + os.environ['RELEASE_TAG'] + '^{commit}'):
+              raise SystemExit('The tag no longer matches the requested commit')
+          if subprocess.run(['git', 'merge-base', '--is-ancestor', head, 'origin/main']).returncode:
+              raise SystemExit('Release tags must point to a commit on main')
+          PY
+      - name: Verify SDK and credentials
+        env:
+          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          python3 - <<'PY'
+          import os, platform, subprocess
+          required = ['MACOS_SIGN_P12', 'MACOS_SIGN_PASSWORD', 'MACOS_NOTARY_KEY', 'MACOS_NOTARY_KEY_ID', 'MACOS_NOTARY_ISSUER_ID', 'SPARKLE_PRIVATE_KEY']
+          missing = [name for name in required if not os.environ.get(name)]
+          if missing: raise SystemExit('Missing release secrets: ' + ', '.join(missing))
+          sdk = subprocess.check_output(['xcrun', '--sdk', 'macosx', '--show-sdk-version'], text=True).strip()
+          if int(sdk.split('.')[0]) < 27 or int(platform.mac_ver()[0].split('.')[0]) < 27 or platform.machine() != 'arm64':
+              raise SystemExit('Select an Apple-silicon runner running macOS 27 with Xcode 27 / macOS 27 SDK')
+          PY
+      - name: Build and validate
+        run: |
+          # Compiler diagnostics can contain private source snippets. Keep them
+          # on the disposable runner, outside public Actions logs and artifacts.
+          if ! (cargo fetch --locked && python3 scripts/sparkle.py && make check) > "$RUNNER_TEMP/max-validation.log" 2>&1; then
+            echo '::error::Build or validation failed. Run make check at the tagged commit to inspect diagnostics locally.'
+            exit 1
+          fi
+          echo 'Build and validation passed.'
+      - name: Sign, notarize, and prepare updates
+        env:
+          MAX_RELEASE_VERSION: ${{ steps.source.outputs.version }}
+          MAX_RELEASE_BUILD: ${{ github.run_number }}
+          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          if ! python3 scripts/release.py --version "$MAX_RELEASE_VERSION" --build "$MAX_RELEASE_BUILD" > "$RUNNER_TEMP/max-signing.log" 2>&1; then
+            echo '::error::Signing or notarization failed. Verify the Apple and Sparkle secrets; use scripts/release.py locally for detailed diagnostics.'
+            exit 1
+          fi
+          echo 'Developer ID signing, notarization, and Sparkle signing passed.'
+      - name: Publish the downloadable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAX_RELEASE_VERSION: ${{ steps.source.outputs.version }}
+        run: python3 scripts/publish_release.py "dist/v$MAX_RELEASE_VERSION" --publish
