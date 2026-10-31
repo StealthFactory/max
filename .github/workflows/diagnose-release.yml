@@ -103,7 +103,7 @@ jobs:
           logs = pathlib.Path(os.environ['RUNNER_TEMP'])
           allowed_files = {p.name for p in pathlib.Path('macos/Tests').glob('*.swift')}
           assertion = re.compile(r'Native assertion: ([A-Za-z][A-Za-z0-9]*\.swift):([1-9]\d*)')
-          metric = re.compile(r'Native metric: preview\.(?:requested-right|host-width|host-height|screen-width|screen-height|cells|editing|cell-[01]\.(?:x|y|width|height|hidden|visible-width|visible-height))=-?\d+(?:\.\d+)?')
+          metric = re.compile(r'Native metric: (?:preview\.(?:requested-right|host-width|host-height|screen-width|screen-height|cells|editing|cell-[01]\.(?:x|y|width|height|hidden|visible-width|visible-height))|reference\.stage|page-scroll\.(?:wall-p95|sync-p95|yield-p95)|daily\.(?:wall-p95|sync-p95|yield-p95|wrong-direction|idle-drift|content-drift)|cadence\.(?:page|daily)\.(?:baseline-count|baseline-p95|baseline-max|count|hz|p95|max))=-?\d+(?:\.\d+)?')
           def report(line):
               value = line.strip()
               match = assertion.fullmatch(value)
@@ -140,8 +140,10 @@ jobs:
           binary = pathlib.Path('.build/ModelTests')
           if not binary.exists():
               raise SystemExit('Native test compilation did not produce the fixture executable')
-          core = run('core-sequence', [str(binary.resolve())], {'OK_NATIVE_GROUP': 'core'}, timeout=120)
-          preview = run('code-preview', [str(binary.resolve())],
-              {'OK_PRESENTATION_ONLY': '1', 'OK_CODE_PREVIEW_ONLY': '1'}, timeout=120)
-          raise SystemExit(1 if pointer or core or preview else 0)
+          failed = bool(pointer)
+          for group in ['mounted-editing', 'navigation', 'reference-layout', 'daily-media', 'scroll-cadence']:
+              code = run(group, [str(binary.resolve())],
+                  {'OK_NATIVE_GROUP': group, 'OK_NATIVE_DIAGNOSTICS': '1'}, timeout=120)
+              failed = failed or bool(code)
+          raise SystemExit(1 if failed else 0)
           PYTHON
