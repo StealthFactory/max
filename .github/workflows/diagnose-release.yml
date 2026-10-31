@@ -8,6 +8,15 @@ on:
         required: true
         type: string
 
+      scope:
+        description: Validation scope
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - native-failures
+
 permissions:
   contents: read
 
@@ -38,6 +47,7 @@ jobs:
       - name: Verify main ancestry
         run: git merge-base --is-ancestor HEAD origin/main
       - name: Validate with private hang samples
+        if: inputs.scope == 'all'
         run: |
           python3 - <<'PY'
           import os, pathlib, subprocess, sys, threading, time
@@ -85,3 +95,52 @@ jobs:
               worker.join(timeout=6)
           raise SystemExit(result.returncode)
           PY
+      - name: Diagnose the failing native fixtures
+        if: inputs.scope == 'native-failures'
+        run: |
+          python3 - <<'PYTHON'
+          import os, pathlib, re, signal, subprocess, sys, time
+          logs = pathlib.Path(os.environ['RUNNER_TEMP'])
+          allowed_files = {p.name for p in pathlib.Path('macos/Tests').glob('*.swift')}
+          assertion = re.compile(r'Native assertion: ([A-Za-z][A-Za-z0-9]*\.swift):([1-9]\d*)')
+          metric = re.compile(r'Native metric: preview\.(?:requested-right|host-width|host-height|screen-width|screen-height|cells|editing|cell-[01]\.(?:x|y|width|height|hidden|visible-width|visible-height))=-?\d+(?:\.\d+)?')
+          def report(line):
+              value = line.strip()
+              match = assertion.fullmatch(value)
+              if (match and match[1] in allowed_files) or metric.fullmatch(value):
+                  print(value, flush=True)
+          def run(label, command, extra=None, timeout=600):
+              print(f'Probe: {label} started', flush=True)
+              started = time.monotonic()
+              path = logs / f'max-probe-{label}.log'
+              with path.open('w') as output:
+                  process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT,
+                      env=dict(os.environ, PYTHONUNBUFFERED='1', **(extra or {})), start_new_session=True)
+                  try:
+                      while True:
+                          remaining = timeout - (time.monotonic() - started)
+                          if remaining <= 0:
+                              raise subprocess.TimeoutExpired(command, timeout)
+                          try:
+                              code = process.wait(timeout=min(30, remaining))
+                              break
+                          except subprocess.TimeoutExpired:
+                              print(f'Probe: {label} running for {time.monotonic() - started:.0f} seconds', flush=True)
+                  except subprocess.TimeoutExpired:
+                      os.killpg(process.pid, signal.SIGKILL)
+                      process.wait(timeout=5)
+                      code = 124
+              for line in path.read_text(errors='replace').splitlines():
+                  report(line)
+              print(f'Probe: {label} completed; exit={code}; elapsed={time.monotonic() - started:.1f}', flush=True)
+              return code
+          if run('rust-build', ['cargo', 'build', '--release', '--locked']):
+              raise SystemExit(1)
+          pointer = run('pointer', [sys.executable, 'scripts/test_native.py'], {'OK_POINTER_ONLY': '1'})
+          binary = pathlib.Path('.build/ModelTests')
+          if not binary.exists():
+              raise SystemExit('Native test compilation did not produce the fixture executable')
+          preview = run('code-preview', [str(binary.resolve())],
+              {'OK_PRESENTATION_ONLY': '1', 'OK_CODE_PREVIEW_ONLY': '1'}, timeout=120)
+          raise SystemExit(1 if pointer or preview else 0)
+          PYTHON
