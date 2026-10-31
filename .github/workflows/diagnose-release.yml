@@ -1,0 +1,87 @@
+name: Diagnose max validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Exact commit on StealthFactory/ok main to validate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    if: github.repository == 'StealthFactory/max'
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+      - name: Validate the requested source
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          if not re.fullmatch('[0-9a-f]{40}', os.environ['SOURCE_COMMIT']):
+              raise SystemExit('Provide an exact source commit')
+          PY
+      - name: Check out private source for validation only
+        uses: actions/checkout@v6
+        with:
+          repository: StealthFactory/ok
+          ref: ${{ inputs.source_commit }}
+          token: ${{ secrets.SOURCE_READ_TOKEN }}
+          fetch-depth: 0
+          persist-credentials: false
+          show-progress: false
+      - name: Verify main ancestry
+        run: git merge-base --is-ancestor HEAD origin/main
+      - name: Validate with private hang samples
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, subprocess, sys, threading, time
+          root = pathlib.Path.cwd()
+          logs = pathlib.Path(os.environ['RUNNER_TEMP'])
+          stopped = threading.Event()
+          def sample_stalls():
+              seen, sampled = {}, set()
+              while not stopped.wait(1):
+                  listing = subprocess.run(['pgrep', '-x', 'ModelTests'], text=True, capture_output=True)
+                  for raw in listing.stdout.splitlines():
+                      if not raw.isdigit():
+                          continue
+                      pid = int(raw)
+                      seen.setdefault(pid, time.monotonic())
+                      if pid in sampled or time.monotonic() - seen[pid] < 110:
+                          continue
+                      sampled.add(pid)
+                      sample = logs / f'max-hang-{pid}.txt'
+                      try:
+                          subprocess.run(['sample', str(pid), '1', '-file', str(sample)],
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+                      except subprocess.TimeoutExpired:
+                          print('Probe: native stack sampler timed out', flush=True)
+                          continue
+                      text = sample.read_text(errors='replace') if sample.exists() else ''
+                      labels = {
+                          'verifyTextSelectionAppearance': 'text-selection test',
+                          'verifyBlockDragSelection': 'block-drag test',
+                          'verifyBlockMovement': 'block-movement test',
+                          'verifyEditorBugReports': 'editor-report test',
+                          'verifyMountedEditorInteractions': 'mounted-editor test',
+                          'mouseDown': 'mouse-down tracking',
+                          'nextEventMatchingMask': 'native event wait',
+                          'IconServices': 'system icon service',
+                      }
+                      matches = [label for symbol, label in labels.items() if symbol in text]
+                      print('Probe: slow native process sampled; ' + (', '.join(matches) or 'no known wait signature'), flush=True)
+          worker = threading.Thread(target=sample_stalls, daemon=True)
+          worker.start()
+          try:
+              result = subprocess.run([sys.executable, 'scripts/check_release_build.py'])
+          finally:
+              stopped.set()
+              worker.join(timeout=6)
+          raise SystemExit(result.returncode)
+          PY
