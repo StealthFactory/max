@@ -104,14 +104,7 @@ jobs:
               raise SystemExit('Select an Apple-silicon runner running macOS 27 with Xcode 27 / macOS 27 SDK')
           PY
       - name: Build and validate
-        run: |
-          # Compiler diagnostics can contain private source snippets. Keep them
-          # on the disposable runner, outside public Actions logs and artifacts.
-          if ! (cargo fetch --locked && python3 scripts/sparkle.py && make check) > "$RUNNER_TEMP/max-validation.log" 2>&1; then
-            echo '::error::Build or validation failed. Run make check at the tagged commit to inspect diagnostics locally.'
-            exit 1
-          fi
-          echo 'Build and validation passed.'
+        run: python3 scripts/check_release_build.py
       - name: Sign, notarize, and prepare updates
         env:
           MAX_RELEASE_VERSION: ${{ steps.source.outputs.version }}
