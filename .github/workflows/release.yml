@@ -12,13 +12,20 @@ permissions:
 concurrency:
   group: max-release
   cancel-in-progress: false
+  queue: max
 
 jobs:
   release:
     if: github.repository == 'StealthFactory/max' && github.event.deleted != true
     runs-on: xcode-27
+    timeout-minutes: 75
     permissions:
-      contents: write
+      contents: read
+    outputs:
+      repository: ${{ steps.source.outputs.repository }}
+      commit: ${{ steps.source.outputs.commit }}
+      version: ${{ steps.source.outputs.version }}
+      artifact: ${{ steps.package.outputs.artifact-id }}
     steps:
       - name: Resolve the tagged source
         id: source
@@ -103,8 +110,40 @@ jobs:
           if int(sdk.split('.')[0]) < 27 or int(platform.mac_ver()[0].split('.')[0]) < 27 or platform.machine() != 'arm64':
               raise SystemExit('Select an Apple-silicon runner running macOS 27 with Xcode 27 / macOS 27 SDK')
           PY
-      - name: Build and validate
-        run: python3 scripts/check_release_build.py
+      - name: Reject obsolete releases before building
+        env:
+          MAX_RELEASE_VERSION: ${{ steps.source.outputs.version }}
+          MAX_RELEASE_BUILD: ${{ github.run_number }}
+        run: python3 scripts/preflight_release.py
+      # Only public dependencies are cached here. Never cache private source,
+      # native object files, test executables, logs, or credentials in max.
+      - name: Restore public dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            .build/Sparkle-*.tar.xz
+          key: release-deps-${{ runner.os }}-${{ runner.arch }}-v1-${{ hashFiles('Cargo.lock', 'scripts/sparkle.py') }}
+      - name: Fetch dependencies
+        timeout-minutes: 10
+        run: python3 scripts/check_release_build.py --stage dependencies
+      - name: Check Rust and release tooling
+        timeout-minutes: 15
+        run: python3 scripts/check_release_build.py --stage checks
+      - name: Build the app once
+        timeout-minutes: 15
+        run: python3 scripts/check_release_build.py --stage app
+      - name: Check editor algorithms
+        timeout-minutes: 10
+        run: python3 scripts/check_release_build.py --stage algorithms
+      - name: Compile native regressions once
+        timeout-minutes: 15
+        run: python3 scripts/check_release_build.py --stage native-build
+      - name: Run native regressions
+        timeout-minutes: 30
+        run: python3 scripts/check_release_build.py --stage native
+      - name: Seal the validated app
+        run: python3 scripts/check_release_build.py --stage finalize
       - name: Sign, notarize, and prepare updates
         env:
           MAX_RELEASE_VERSION: ${{ steps.source.outputs.version }}
@@ -115,14 +154,53 @@ jobs:
           MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
           MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
-        run: |
-          if ! python3 scripts/release.py --version "$MAX_RELEASE_VERSION" --build "$MAX_RELEASE_BUILD" > "$RUNNER_TEMP/max-signing.log" 2>&1; then
-            echo '::error::Signing or notarization failed. Verify the Apple and Sparkle secrets; use scripts/release.py locally for detailed diagnostics.'
-            exit 1
-          fi
-          echo 'Developer ID signing, notarization, and Sparkle signing passed.'
-      - name: Publish the downloadable release
+        timeout-minutes: 30
+        run: python3 scripts/prepare_release.py
+      - name: Keep the prepared installer for publish retries
+        id: package
+        uses: actions/upload-artifact@v4
+        with:
+          name: max-${{ steps.source.outputs.version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/v${{ steps.source.outputs.version }}/max-${{ steps.source.outputs.version }}.dmg
+            dist/v${{ steps.source.outputs.version }}/appcast.xml
+            dist/v${{ steps.source.outputs.version }}/SHA256SUMS
+            dist/v${{ steps.source.outputs.version }}/release-notes.md
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  publish:
+    needs: release
+    runs-on: xcode-27
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the exact publishing tools
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ needs.release.outputs.repository }}
+          ref: ${{ needs.release.outputs.commit }}
+          token: ${{ needs.release.outputs.repository == 'StealthFactory/ok' && secrets.SOURCE_READ_TOKEN || github.token }}
+          persist-credentials: false
+          show-progress: false
+      - name: Restore the signed installer
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.release.outputs.artifact }}
+          path: dist/v${{ needs.release.outputs.version }}
+          merge-multiple: true
+      - name: Verify and publish the downloadable release
+        timeout-minutes: 10
         env:
           GH_TOKEN: ${{ github.token }}
-          MAX_RELEASE_VERSION: ${{ steps.source.outputs.version }}
+          MAX_RELEASE_VERSION: ${{ needs.release.outputs.version }}
         run: python3 scripts/publish_release.py "dist/v$MAX_RELEASE_VERSION" --publish
+      - name: Release summary
+        if: always()
+        env:
+          RELEASE_VERSION: ${{ needs.release.outputs.version }}
+          PUBLISH_RESULT: ${{ job.status }}
+        run: |
+          printf '### max %s\n\nPublish: %s\n\n[Download](https://github.com/StealthFactory/max/releases/tag/v%s)\n\nIf publication failed, use **Re-run failed jobs** within 7 days. The signed installer is retained; no rebuild or notarization is needed.\n' "$RELEASE_VERSION" "$PUBLISH_RESULT" "$RELEASE_VERSION" >> "$GITHUB_STEP_SUMMARY"
