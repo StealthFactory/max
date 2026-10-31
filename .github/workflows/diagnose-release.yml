@@ -140,7 +140,8 @@ jobs:
           binary = pathlib.Path('.build/ModelTests')
           if not binary.exists():
               raise SystemExit('Native test compilation did not produce the fixture executable')
+          core = run('core-sequence', [str(binary.resolve())], {'OK_NATIVE_GROUP': 'core'}, timeout=120)
           preview = run('code-preview', [str(binary.resolve())],
               {'OK_PRESENTATION_ONLY': '1', 'OK_CODE_PREVIEW_ONLY': '1'}, timeout=120)
-          raise SystemExit(1 if pointer or preview else 0)
+          raise SystemExit(1 if pointer or core or preview else 0)
           PYTHON
