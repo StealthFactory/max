@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   release:
-    if: github.repository == 'StealthFactory/max' && github.event.deleted != true
+    if: github.repository == 'StealthFactory/max' && github.event.deleted != true && (github.event_name == 'repository_dispatch' || vars.MAX_SOURCE_REPOSITORY == 'StealthFactory/max')
     runs-on: xcode-27
     timeout-minutes: 75
     permissions:
@@ -31,6 +31,7 @@ jobs:
         id: source
         env:
           SOURCE_READ_TOKEN: ${{ secrets.SOURCE_READ_TOKEN }}
+          MAX_SOURCE_REPOSITORY: ${{ vars.MAX_SOURCE_REPOSITORY || 'StealthFactory/ok' }}
         run: |
           python3 - <<'PY'
           import json, os, re
@@ -38,14 +39,19 @@ jobs:
           event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text())
           if os.environ['GITHUB_REPOSITORY'] != 'StealthFactory/max':
               raise SystemExit('Releases run only in StealthFactory/max')
+          configured_source = os.environ.get('MAX_SOURCE_REPOSITORY', 'StealthFactory/ok')
+          if configured_source not in ('StealthFactory/ok', 'StealthFactory/max'):
+              raise SystemExit('Unexpected source repository configuration')
           if os.environ['GITHUB_EVENT_NAME'] == 'repository_dispatch':
               payload = event.get('client_payload', {})
-              if event.get('action') != 'max-release' or payload.get('source_repository') != 'StealthFactory/ok':
+              if event.get('action') != 'max-release' or payload.get('source_repository') != configured_source or configured_source != 'StealthFactory/ok':
                   raise SystemExit('Unexpected release source')
               repository, tag, commit = payload['source_repository'], payload.get('tag', ''), payload.get('commit', '')
               if not os.environ.get('SOURCE_READ_TOKEN'):
                   raise SystemExit('Configure SOURCE_READ_TOKEN in StealthFactory/max')
           elif os.environ['GITHUB_EVENT_NAME'] == 'push':
+              if configured_source != 'StealthFactory/max':
+                  raise SystemExit('Download tags are not source releases; source is still in StealthFactory/ok')
               if event.get('deleted') or event.get('forced') or not event.get('ref', '').startswith('refs/tags/'):
                   raise SystemExit('Release requires a newly pushed version tag')
               repository, tag, commit = os.environ['GITHUB_REPOSITORY'], event['ref'][10:], os.environ['GITHUB_SHA']
@@ -55,8 +61,11 @@ jobs:
               raise SystemExit('Use a stable tag such as v0.1.0')
           if not isinstance(commit, str) or not re.fullmatch(r'[0-9a-f]{40}', commit):
               raise SystemExit('Expected the exact source commit')
+          validation = event.get('client_payload', {}).get('validation_commit', commit)
+          if not isinstance(validation, str) or not re.fullmatch(r'[0-9a-f]{40}', validation):
+              raise SystemExit('Expected an immutable validation commit')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              for key, value in {'repository': repository, 'tag': tag, 'commit': commit, 'version': tag[1:]}.items():
+              for key, value in {'repository': repository, 'tag': tag, 'commit': commit, 'version': tag[1:], 'validation': validation}.items():
                   output.write(f'{key}={value}\n')
           PY
       - name: Check out the private tagged source
@@ -92,6 +101,16 @@ jobs:
           if subprocess.run(['git', 'merge-base', '--is-ancestor', head, 'origin/main']).returncode:
               raise SystemExit('Release tags must point to a commit on main')
           PY
+      - name: Apply validation-only corrections for this source tag
+        if: steps.source.outputs.validation != steps.source.outputs.commit
+        env:
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+          VALIDATION_COMMIT: ${{ steps.source.outputs.validation }}
+        run: |
+          git merge-base --is-ancestor "$SOURCE_COMMIT" "$VALIDATION_COMMIT"
+          git merge-base --is-ancestor "$VALIDATION_COMMIT" origin/main
+          git show "$VALIDATION_COMMIT:scripts/release_validation_overlay.py" > "$RUNNER_TEMP/max-validation-overlay.py"
+          python3 "$RUNNER_TEMP/max-validation-overlay.py" --source "$SOURCE_COMMIT" --validation "$VALIDATION_COMMIT"
       - name: Verify SDK and credentials
         env:
           MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
